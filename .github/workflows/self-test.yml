@@ -1,0 +1,108 @@
+name: Self-test
+
+# Runs the action from this commit against the fixtures, once per way it can
+# end. A case that should fail is asserted on the reason as well as the
+# failure: a step that went red for some other reason is not this case seen to
+# fail, and passes nothing.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  case:
+    name: ${{ matrix.case }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        case: [caught, skip, report-only, mismatch, could-not-run, crash, dirty-after, dirty-before, bad-hash]
+        include:
+          # The positive control on macOS too, for repositories whose checks
+          # need a Mac runner.
+          - { os: macos-latest, case: caught, declaration: caught.json, outcome: success, result: passed }
+          - { case: caught, declaration: caught.json, outcome: success, result: passed }
+          - { case: skip, declaration: skip.json, skip: needsRunner, outcome: success, result: passed }
+          - { case: report-only, declaration: blind.json, fail-on-mismatch: 'false', outcome: success, result: mismatch }
+          - { case: mismatch, declaration: blind.json, outcome: failure, result: mismatch }
+          - { case: could-not-run, declaration: no-run.json, outcome: failure, result: could-not-run }
+          # canfail crashes with a traceback and exits 1, the code it also uses
+          # for a blind guard. The report is not JSON, so it is not a verdict.
+          - { case: crash, declaration: crash.json, outcome: failure, result: could-not-run }
+          - { case: dirty-after, declaration: leaves-file.json, outcome: failure, result: dirty-after }
+          - { case: dirty-before, declaration: caught.json, outcome: failure, result: dirty-before }
+          - { case: bad-hash, declaration: caught.json, outcome: failure, result: install }
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Leave the tree dirty before planting
+        if: matrix.case == 'dirty-before'
+        run: echo stray > fixtures/stray.txt
+
+      # A copy of the action with canfail's hashes changed. Every one of them:
+      # pip accepts an archive that matches any hash listed for its package, so
+      # changing one of the two (wheel and sdist) leaves the other to match and
+      # the install passes, which is what the first run of this case did. The
+      # copy is excluded through .git/info/exclude, which is never committed, so
+      # it does not make the tree dirty and the failure has to come from pip.
+      - name: Change canfail's pinned hashes in a copy of the action
+        if: matrix.case == 'bad-hash'
+        run: |
+          set -euo pipefail
+          mkdir tampered
+          cp action.yml canfail_action.py requirements.txt tampered/
+          echo tampered/ >> .git/info/exclude
+          zeros=$(printf '0%.0s' $(seq 64))
+          sed -i "/^canfail==/,/^didrun==/ s/sha256:[0-9a-f]*/sha256:$zeros/" tampered/requirements.txt
+          changed=$(diff requirements.txt tampered/requirements.txt | grep -c '^>' || true)
+          if [ "$changed" -ne 2 ]; then
+            echo "The plant changed $changed hash lines, not canfail's 2." >&2
+            exit 1
+          fi
+
+      - name: Run the action
+        id: action
+        if: matrix.case != 'bad-hash'
+        continue-on-error: true
+        uses: ./
+        with:
+          working-directory: fixtures
+          declaration: ${{ matrix.declaration }}
+          skip: ${{ matrix.skip }}
+          fail-on-mismatch: ${{ matrix.fail-on-mismatch || 'true' }}
+
+      - name: Run the tampered copy
+        id: tampered
+        if: matrix.case == 'bad-hash'
+        continue-on-error: true
+        uses: ./tampered
+        with:
+          working-directory: fixtures
+          declaration: ${{ matrix.declaration }}
+
+      - name: Assert how it ended
+        env:
+          OUTCOME: ${{ matrix.case == 'bad-hash' && steps.tampered.outcome || steps.action.outcome }}
+          RESULT: ${{ matrix.case == 'bad-hash' && steps.tampered.outputs.result || steps.action.outputs.result }}
+          REPORT: ${{ steps.action.outputs.report }}
+          WANT_OUTCOME: ${{ matrix.outcome }}
+          WANT_RESULT: ${{ matrix.result }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME (want $WANT_OUTCOME), result=$RESULT (want $WANT_RESULT)"
+          if [ "$OUTCOME" != "$WANT_OUTCOME" ] || [ "$RESULT" != "$WANT_RESULT" ]; then
+            echo "::error::Expected $WANT_OUTCOME/$WANT_RESULT, got $OUTCOME/$RESULT"
+            exit 1
+          fi
+          if [ "$WANT_OUTCOME" = success ]; then
+            jq -e '.outcomes | length > 0' "$REPORT" > /dev/null
+          fi
